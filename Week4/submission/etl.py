@@ -2,47 +2,45 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import logging
 import os
-from dotenv import load_dotenv 
-
+from dotenv import load_dotenv
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s"
+    level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 SOURCE_DB_CONFIG = dict(
-    host=    os.getenv("DB_HOST"),
-    port =   os.getenv("DB_PORT"),
-    dbname = os.getenv("DB_NAME"),
-    user=    os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD")
+    port=os.getenv("SRC_DB_PORT"),
+    dbname=os.getenv("SRC_DB_NAME"),
+    host=os.getenv("SRC_DB_HOST"),
+    user=os.getenv("SRC_DB_USER"),
+    password=os.getenv("SRC_DB_PASSWORD"),
 )
 DEST_DB_CONFIG = dict(
-    host=    os.getenv("DEST_DB_HOST"),
-    port =   os.getenv("DEST_DB_PORT"),
-    dbname = os.getenv("DEST_DB_NAME"),
-    user=    os.getenv("DEST_DB_USER"),
-    password=os.getenv("DEST_DB_PASSWORD")
+    host=os.getenv("DEST_DB_HOST"),
+    port=os.getenv("DEST_DB_PORT"),
+    dbname=os.getenv("DEST_DB_NAME"),
+    user=os.getenv("DEST_DB_USER"),
+    password=os.getenv("DEST_DB_PASSWORD"),
 )
 
 
-
-def extract(conn,sql):
+def extract(conn, sql):
     try:
-        with conn.cursor(cursor_factory =RealDictCursor ) as curr:
+        with conn.cursor(cursor_factory=RealDictCursor) as curr:
             curr.execute(sql)
             rows = curr.fetchall()
             logger.info(f"Extracted {len(rows)} from the table")
         return rows
     except Exception as e:
         logger.error(str(e))
-        raise 
-    
+        raise
+
+
 def extract_driver(conn):
-     extract_driver_sql = """
+    extract_driver_sql = """
     SELECT
         driver_id ,
         name,
@@ -57,13 +55,10 @@ def extract_driver(conn):
     FROM
         drivers d ;
     """
-     return extract(conn,extract_driver_sql)
-
-    
+    return extract(conn, extract_driver_sql)
 
 
-
-def load_dim_driver(conn,driver_data):
+def load_dim_driver(conn, driver_data):
     insert_dim_driver_sql = """
  INSERT INTO dim_driver
     (driver_id, name, status, joined_at,tenure_bucket)
@@ -255,7 +250,74 @@ def load_dim_promo_code(conn, promo_code_data):
         logger.error(str(e))
         raise
 
-def extract_trips(conn):
+
+def extract_vehicle(conn):
+    extract_vehicle_sql = """
+    SELECT
+        vehicle_id,
+        plate_number ,
+        make ,
+        model,
+        year ,
+        color,
+        category ,
+        is_active 
+    FROM
+        vehicles v ;
+    """
+    return extract(conn, extract_vehicle_sql)
+
+
+# NOTE: Postgres folds unquoted identifiers to lowercase internally (e.g. YEAR
+# becomes year), regardless of how they're typed in SQL. So even though the
+# column is written as YEAR in warehouse.sql, psycopg2's RealDictCursor
+# returns it as the key 'year' in each row dict. Placeholders here use
+# %(year)s (lowercase) to match that, not %(YEAR)s. Hence, The YEAR has been
+# now converted to year.
+
+
+def load_dim_vehicle(conn, vehicle_data):
+    insert_dim_vehicle_sql = """
+ INSERT INTO dim_vehicle
+    (vehicle_id, plate_number, make, model, year, color, category, is_active)
+    VALUES ( %(vehicle_id)s,
+             %(plate_number)s ,
+             %(make)s ,
+             %(model)s,
+             %(year)s ,
+             %(color)s,
+             %(category)s ,
+             %(is_active)s 
+            )
+    ON CONFLICT DO NOTHING
+"""
+    try:
+        with conn.cursor() as curr:
+            curr.executemany(insert_dim_vehicle_sql, vehicle_data)
+            logger.info(f"{curr.rowcount} inserted to dim_vehicle")
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(str(e))
+        raise
+
+
+# NOTE: dim_driver, dim_passenger, and dim_vehicle use bare ON CONFLICT DO NOTHING
+# even though their natural keys (driver_id, passenger_id, vehicle_id) have no
+# UNIQUE constraint. This means re-running the ETL will NOT dedupe existing
+# entities, it's consistent with the schema design (SCD-friendly, allows
+# multiple rows per entity over time) but does not protect against exact
+# duplicate re-inserts.
+
+
+def get_watermark(conn):
+    with conn.cursor() as curr:
+        curr.execute("SELECT MAX(requested_at) FROM fact_trips")
+        result = curr.fetchone()[0]
+    return result
+
+
+def extract_trips(conn, watermark=None):
     extract_trip_sql = """
       SELECT
         t.trip_id,
@@ -265,6 +327,7 @@ def extract_trips(conn):
         t.dropoff_location_id,
         t.payment_method_id,
         t.promo_code_id,
+        t.vehicle_id,
         t.base_fare,
         t.tip_amount,
         t.discount_amount,
@@ -278,31 +341,54 @@ def extract_trips(conn):
         tc.cancelled_by          -- from trip_cancellations (NULL for non-cancelled)
     FROM  trips t
     LEFT JOIN trip_cancellations tc ON t.trip_id = tc.trip_id
-    ORDER BY t.requested_at
-        """
-    return extract(conn,extract_trip_sql)
+    """
+    params = None
+    if watermark is not None:
+        extract_trip_sql += " WHERE t.requested_at > %s"
+        params = (watermark,)
+    extract_trip_sql += " ORDER BY t.requested_at"
+
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as curr:
+            curr.execute(extract_trip_sql, params)
+            rows = curr.fetchall()
+            logger.info(f"Extracted {len(rows)} from the table")
+        return rows
+    except Exception as e:
+        logger.error(str(e))
+        raise
+
 
 def load_lookup_dim(conn):
     logger.info("Loading lookup table into memmory")
     lookup = {}
     with conn.cursor() as curr:
         curr.execute("SELECT driver_id, driver_key FROM dim_driver")
-        lookup["driver"] = {r[0]:r[1] for r in curr.fetchall()}
+        lookup["driver"] = {r[0]: r[1] for r in curr.fetchall()}
 
         curr.execute("SELECT passenger_id, passenger_key FROM dim_passenger")
-        lookup["passenger"] = {r[0]:r[1] for r in curr.fetchall()}
+        lookup["passenger"] = {r[0]: r[1] for r in curr.fetchall()}
 
         curr.execute("SELECT location_id, location_key FROM dim_location")
-        lookup["location"] = {r[0]:r[1] for r in curr.fetchall()}
+        lookup["location"] = {r[0]: r[1] for r in curr.fetchall()}
 
-        curr.execute("SELECT payment_method_id, payment_method_key FROM dim_payment_method")
-        lookup["payment_method"] = {r[0]:r[1] for r in curr.fetchall()}
+        curr.execute(
+            "SELECT payment_method_id, payment_method_key FROM dim_payment_method"
+        )
+        lookup["payment_method"] = {r[0]: r[1] for r in curr.fetchall()}
 
         curr.execute("SELECT promo_code_id, promo_code_key FROM dim_promo_code")
-        lookup["promo_code"] = {r[0]:r[1] for r in curr.fetchall()}
+        lookup["promo_code"] = {r[0]: r[1] for r in curr.fetchall()}
 
         curr.execute("SELECT date_key FROM dim_date")
         lookup["date"] = {r[0]: True for r in curr.fetchall()}
+
+        curr.execute("SELECT vehicle_id, vehicle_key FROM dim_vehicle")
+        lookup["vehicle"] = {r[0]: r[1] for r in curr.fetchall()}
+
+        curr.execute("SELECT time_key FROM dim_time")
+        lookup["time"] = {r[0]: True for r in curr.fetchall()}
+
     return lookup
 
 
@@ -314,31 +400,41 @@ def transform(oltp_row, lookups):
 
         date_key = int(row["requested_at"].strftime("%Y%m%d"))
         if date_key not in lookups["date"]:
-            logger.warning(f"trip {trip_id}: date_key {date_key} outside of dim_date range — skipped")
+            logger.warning(
+                f"trip {trip_id}: date_key {date_key} outside of dim_date range — skipped"
+            )
             skipped += 1
             continue
 
         driver_key = lookups["driver"].get(row["driver_id"])
         if driver_key is None:
-            logger.warning(f"trip {trip_id}: driver_id {row['driver_id']} not in dim_driver — skipped")
+            logger.warning(
+                f"trip {trip_id}: driver_id {row['driver_id']} not in dim_driver — skipped"
+            )
             skipped += 1
             continue
 
         passenger_key = lookups["passenger"].get(row["passenger_id"])
         if passenger_key is None:
-            logger.warning(f"trip {trip_id}: passenger_id {row['passenger_id']} not in dim_passenger — skipped")
+            logger.warning(
+                f"trip {trip_id}: passenger_id {row['passenger_id']} not in dim_passenger — skipped"
+            )
             skipped += 1
             continue
 
         pickup_location_key = lookups["location"].get(row["pickup_location_id"])
         if pickup_location_key is None:
-            logger.warning(f"trip {trip_id}: pickup_location_id {row['pickup_location_id']} not in dim_location — skipped")
+            logger.warning(
+                f"trip {trip_id}: pickup_location_id {row['pickup_location_id']} not in dim_location — skipped"
+            )
             skipped += 1
             continue
 
         dropoff_location_key = lookups["location"].get(row["dropoff_location_id"])
         if dropoff_location_key is None:
-            logger.warning(f"trip {trip_id}: dropoff_location_id {row['dropoff_location_id']} not in dim_location — skipped")
+            logger.warning(
+                f"trip {trip_id}: dropoff_location_id {row['dropoff_location_id']} not in dim_location — skipped"
+            )
             skipped += 1
             continue
 
@@ -349,7 +445,9 @@ def transform(oltp_row, lookups):
         if row["payment_method_id"] is not None:
             payment_method_key = lookups["payment_method"].get(row["payment_method_id"])
             if payment_method_key is None:
-                logger.warning(f"trip {trip_id}: payment_method_id {row['payment_method_id']} not in dim_payment_method — skipped")
+                logger.warning(
+                    f"trip {trip_id}: payment_method_id {row['payment_method_id']} not in dim_payment_method — skipped"
+                )
                 skipped += 1
                 continue
 
@@ -357,42 +455,68 @@ def transform(oltp_row, lookups):
         if row["promo_code_id"] is not None:
             promo_code_key = lookups["promo_code"].get(row["promo_code_id"])
             if promo_code_key is None:
-                logger.warning(f"trip {trip_id}: promo_code_id {row['promo_code_id']} not in dim_promo_code — skipped")
+                logger.warning(
+                    f"trip {trip_id}: promo_code_id {row['promo_code_id']} not in dim_promo_code — skipped"
+                )
                 skipped += 1
                 continue
 
+        vehicle_key = lookups["vehicle"].get(row["vehicle_id"])
+        if vehicle_key is None:
+            logger.warning(
+                f"trip {trip_id}: vehicle_id {row['vehicle_id']} not in dim_vehicle — skipped"
+            )
+            skipped += 1
+            continue
+
+        time_key = (row["requested_at"].hour * 100) + (
+            (row["requested_at"].minute) // 15
+        ) * 15
+        if time_key not in lookups["time"]:
+            logger.warning(
+                f"trip {trip_id}: time_key {time_key} outside of dim_time range — skipped"
+            )
+            skipped += 1
+            continue
+
         # computed column
-        base_fare = row['base_fare'] or 0
+        base_fare = row["base_fare"] or 0
         tip_amount = row["tip_amount"] or 0
         surge_multiplier = row["surge_multiplier"] or 0
         discount_amount = row["discount_amount"] or 0
-        fare_amount  = round(base_fare * surge_multiplier + tip_amount - discount_amount,2)
+        fare_amount = round(
+            base_fare * surge_multiplier + tip_amount - discount_amount, 2
+        )
 
         duration_minutes = None
         if row["status"] == "completed" and row["completed_at"]:
             delta = row["completed_at"] - row["requested_at"]
             duration_minutes = round(delta.total_seconds() / 60, 1)
 
-        fact_rows.append({
-            "source_trip_id":       trip_id,
-            "date_key":             date_key,
-            "driver_key":           driver_key,
-            "passenger_key":        passenger_key,
-            "pickup_location_key":  pickup_location_key,
-            "dropoff_location_key": dropoff_location_key,
-            "payment_method_key":   payment_method_key,
-            "promo_code_key":       promo_code_key,
-            "base_fare":            base_fare,
-            "tip_amount":           tip_amount,
-            "discount_amount":      discount_amount,
-            "fare_amount":          fare_amount,
-            "distance_km":          row["distance_km"],
-            "duration_minutes":     duration_minutes,
-            "driver_rating":        row["driver_rating"],
-            "passenger_rating":     row["passenger_rating"],
-            "surge_multiplier":     surge_multiplier,
-            "requested_at":         row["requested_at"],
-        })
+        fact_rows.append(
+            {
+                "source_trip_id": trip_id,
+                "date_key": date_key,
+                "driver_key": driver_key,
+                "passenger_key": passenger_key,
+                "pickup_location_key": pickup_location_key,
+                "dropoff_location_key": dropoff_location_key,
+                "payment_method_key": payment_method_key,
+                "promo_code_key": promo_code_key,
+                "vehicle_key": vehicle_key,
+                "time_key": time_key,
+                "base_fare": base_fare,
+                "tip_amount": tip_amount,
+                "discount_amount": discount_amount,
+                "fare_amount": fare_amount,
+                "distance_km": row["distance_km"],
+                "duration_minutes": duration_minutes,
+                "driver_rating": row["driver_rating"],
+                "passenger_rating": row["passenger_rating"],
+                "surge_multiplier": surge_multiplier,
+                "requested_at": row["requested_at"],
+            }
+        )
 
     logger.info(f"Transformed {len(fact_rows)} rows, skipped {skipped}")
     return fact_rows
@@ -403,7 +527,7 @@ def load_fact_trips(conn, fact_data):
  INSERT INTO fact_trips
     (source_trip_id, date_key, driver_key, passenger_key,
      pickup_location_key, dropoff_location_key,
-     payment_method_key, promo_code_key,
+     payment_method_key, promo_code_key,vehicle_key,time_key,
      base_fare, tip_amount, discount_amount, fare_amount,
      distance_km, duration_minutes,
      driver_rating, passenger_rating,
@@ -416,6 +540,8 @@ def load_fact_trips(conn, fact_data):
              %(dropoff_location_key)s,
              %(payment_method_key)s,
              %(promo_code_key)s,
+             %(vehicle_key)s,
+             %(time_key)s,
              %(base_fare)s,
              %(tip_amount)s,
              %(discount_amount)s,
@@ -465,8 +591,13 @@ def main():
         promo_code_data = extract_promo_code(src_conn)
         load_dim_promo_code(dst_conn, promo_code_data)
 
+        vehicle_data = extract_vehicle(src_conn)
+        load_dim_vehicle(dst_conn, vehicle_data)
+
         lookups = load_lookup_dim(dst_conn)
-        rows = extract_trips(src_conn)
+        watermark = get_watermark(dst_conn)
+        logger.info(f"Watermark: {watermark}")
+        rows = extract_trips(src_conn, watermark)
         fact_rows = transform(rows, lookups)
         load_fact_trips(dst_conn, fact_rows)
 
@@ -477,4 +608,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

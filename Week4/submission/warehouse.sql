@@ -160,3 +160,50 @@ FROM
     generate_series(0, 23) AS h,
     generate_series(0, 45, 15) AS m
 ORDER BY h, m;
+
+
+-- Assignment Starts ----------------------------
+
+CREATE TABLE dim_vehicle(
+    vehicle_key SERIAL PRIMARY KEY,
+    vehicle_id INTEGER NOT NULL,
+    plate_number VARCHAR(20) NOT NULL UNIQUE,
+    make VARCHAR(50),
+    model VARCHAR(50),
+    YEAR SMALLINT CHECK (YEAR > 1980),
+    color VARCHAR(30),
+    category VARCHAR(20) CHECK (category IN ('economy', 'comfort', 'xl', 'luxury')),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE
+    
+);
+
+
+ALTER TABLE fact_trips
+ADD COLUMN vehicle_key INTEGER NOT NULL REFERENCES dim_vehicle(vehicle_key),
+ADD COLUMN time_key INTEGER NOT NULL REFERENCES dim_time(time_key) ;
+
+
+-- Should each new key be NOT NULL?
+
+-- Not every new key is to be NOT NULL, it entirely depends on the key
+-- itself. For eg., if the key is absolutely essential and if without
+-- this key a trip cannot legitimately exist in the OLTP source system
+-- then, that key is to be restricted with NOT NULL.
+
+-- In our case, no trip can exist without a vehicle_key because the
+-- entire point of ridesharing app is the matching of vehicle_key and
+-- the driver_key. When a ride is requested then these keys are looked
+-- upon for matching. Hence, a trip cannot exist without the vehicle_key
+-- and so is to be set as NOT NULL.
+
+-- Regarding time_key, requested_at is already a TIMESTAMP NOT NULL in
+-- the fact table which means that every trip has to be requested at
+-- some point for it to exist as a row at all. A timestamp is inherent
+-- to the record's existence and not an optional attribute that gets
+-- attached later. So, time_key, derived from requested_at, inherits
+-- that same guarantee.
+
+-- Contrarily, promo_code_key is nullable in the existing schema,
+-- because a trip can absolutely happen with no promo code applied at
+-- all. Trip can exist with or without promo_code_key, hence as to why
+-- it is not restricted with NOT NULL.
