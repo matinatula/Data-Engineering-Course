@@ -61,8 +61,6 @@ def extract_driver(conn):
 
     
 
-
-
 def load_dim_driver(conn,driver_data):
     insert_dim_driver_sql = """
  INSERT INTO dim_driver
@@ -282,7 +280,7 @@ def extract_trips(conn):
         """
     return extract(conn,extract_trip_sql)
 
-def load_lookup_dim(conn):
+def extract_lookup_dim(conn):   
     logger.info("Loading lookup table into memmory")
     lookup = {}
     with conn.cursor() as curr:
@@ -465,7 +463,7 @@ def main():
         promo_code_data = extract_promo_code(src_conn)
         load_dim_promo_code(dst_conn, promo_code_data)
 
-        lookups = load_lookup_dim(dst_conn)
+        lookups = extract_lookup_dim(dst_conn)
         rows = extract_trips(src_conn)
         fact_rows = transform(rows, lookups)
         load_fact_trips(dst_conn, fact_rows)
