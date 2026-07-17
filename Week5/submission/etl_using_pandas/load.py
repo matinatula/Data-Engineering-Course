@@ -101,13 +101,30 @@ def load_dim_promo_code(conn, promo_code_df):
 """
     _execute(conn, sql, promo_code_df, "dim_promo_code")
 
+def load_dim_vehicle(conn, vehicle_df):
+    sql = """
+ INSERT INTO dim_vehicle
+    (vehicle_id, plate_number, make, model, year, color, category, is_active)
+    VALUES ( %(vehicle_id)s,
+             %(plate_number)s,
+             %(make)s,
+             %(model)s,
+             %(year)s,
+             %(color)s,
+             %(category)s,
+             %(is_active)s
+            )
+    ON CONFLICT DO NOTHING
+"""
+    _execute(conn, sql, vehicle_df, "dim_vehicle")
+
 
 def load_fact_trips(conn, fact_df):
     sql = """
  INSERT INTO fact_trips
     (source_trip_id, date_key, driver_key, passenger_key,
      pickup_location_key, dropoff_location_key,
-     payment_method_key, promo_code_key,
+     payment_method_key, promo_code_key, vehicle_key, time_key,
      base_fare, tip_amount, discount_amount, fare_amount,
      distance_km, duration_minutes,
      driver_rating, passenger_rating,
@@ -120,6 +137,8 @@ def load_fact_trips(conn, fact_df):
              %(dropoff_location_key)s,
              %(payment_method_key)s,
              %(promo_code_key)s,
+             %(vehicle_key)s,
+             %(time_key)s,
              %(base_fare)s,
              %(tip_amount)s,
              %(discount_amount)s,

@@ -55,6 +55,13 @@ def extract_promo_code(conn):
     """
     return extract(conn, sql)
 
+def extract_vehicle(conn):
+    sql = """
+    SELECT vehicle_id, plate_number, make, model, year, color, category, is_active
+    FROM vehicles
+    """
+    return extract(conn, sql)
+
 
 def extract_trips_incremental(conn, watermark):
     sql = """
@@ -66,6 +73,7 @@ def extract_trips_incremental(conn, watermark):
         t.dropoff_location_id,
         t.payment_method_id,
         t.promo_code_id,
+        t.vehicle_id,
         t.base_fare,
         t.tip_amount,
         t.discount_amount,
@@ -95,6 +103,7 @@ def extract_trips_full(conn):
         t.dropoff_location_id,
         t.payment_method_id,
         t.promo_code_id,
+        t.vehicle_id,
         t.base_fare,
         t.tip_amount,
         t.discount_amount,
@@ -124,6 +133,8 @@ def extract_lookup_dim(conn):
         ),
         "promo_code": pd.read_sql_query("SELECT promo_code_id, promo_code_key FROM dim_promo_code", conn),
         "date": pd.read_sql_query("SELECT date_key FROM dim_date", conn),
+        "vehicle": pd.read_sql_query("SELECT vehicle_id, vehicle_key FROM dim_vehicle", conn),
+        "time": pd.read_sql_query("SELECT time_key FROM dim_time", conn),
     }
     return lookup
 

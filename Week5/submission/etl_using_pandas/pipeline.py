@@ -2,6 +2,8 @@ import argparse
 import logging
 import os
 import time
+import sys
+from datetime import datetime
 
 import psycopg2
 from dotenv import load_dotenv
@@ -12,6 +14,7 @@ from extract import (
     extract_location,
     extract_payment_method,
     extract_promo_code,
+    extract_vehicle,
     extract_trips_incremental,
     extract_trips_full,
     extract_lookup_dim,
@@ -29,6 +32,7 @@ from load import (
     load_dim_location,
     load_dim_payment_method,
     load_dim_promo_code,
+    load_dim_vehicle,
     load_fact_trips,
 )
 
@@ -42,13 +46,9 @@ def parse_args():
         action="store_true",
         help="Truncate warehouse and reload all data (default: incremental)"
     )
+    parser.add_argument("log_name", nargs="?")
     return parser.parse_args()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -68,13 +68,27 @@ DEST_DB_CONFIG = dict(
 )
 
 
-
 def main():
     args = parse_args()
     mode = 'FULL' if args.full_reload else 'INCREMENTAL'
-    """
-    Extract all dimension data from the source DB and load them into the target DB.
-    """
+
+    if args.log_name:
+        log_filename = f"logs/{args.log_name}.log"
+    else:
+        log_filename = datetime.now().strftime("logs/pipeline_%Y%m%d_%H%M%S.log")
+
+    os.makedirs("logs", exist_ok=True)
+    file_handler = logging.FileHandler(log_filename)
+    console_handler = logging.StreamHandler()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
+        handlers=[file_handler, console_handler]
+    )
+    global logger
+    logger = logging.getLogger(__name__)
+
     src_conn = psycopg2.connect(**SOURCE_DB_CONFIG)
     dst_conn = psycopg2.connect(**DEST_DB_CONFIG)
     try:
@@ -84,6 +98,7 @@ def main():
         load_dim_location(dst_conn, derive_location_dim(extract_location(src_conn)))
         load_dim_payment_method(dst_conn, extract_payment_method(src_conn))
         load_dim_promo_code(dst_conn, extract_promo_code(src_conn))
+        load_dim_vehicle(dst_conn, extract_vehicle(src_conn))
         logger.info(f"Dimention table load completed on {time.time() - time0:.2f}s")
 
         time0 = time.time()
@@ -102,12 +117,19 @@ def main():
         fact_df = transform_trips(trips_df, lookups)
         logger.info(f"Transformation completed on {time.time() - time0:.2f}s")
 
+        if fact_df.empty:
+            logger.info("No new trips to process: pipeline complete, nothing to load")
+            return
+        
         time0 = time.time()
         run_quality_checks(fact_df)
         logger.info(f"Quality Check completed on {time.time() - time0:.2f}s")
         time0 = time.time()
         load_fact_trips(dst_conn, fact_df)
         logger.info(f"Trip table load completed on {time.time() - time0:.2f}s")
+    except Exception:
+        logger.exception("Pipeline failed")
+        raise
     finally:
         src_conn.close()
         dst_conn.close()

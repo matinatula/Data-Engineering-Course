@@ -69,7 +69,7 @@ def _drop_unmatched(df: pd.DataFrame, key_col: str, label: str) -> pd.DataFrame:
 FACT_COLUMNS = [
     "source_trip_id", "date_key", "driver_key", "passenger_key",
     "pickup_location_key", "dropoff_location_key",
-    "payment_method_key", "promo_code_key",
+    "payment_method_key", "promo_code_key", "vehicle_key", "time_key",
     "base_fare", "tip_amount", "discount_amount", "fare_amount",
     "distance_km", "status", "duration_minutes",
     "driver_rating", "passenger_rating",
@@ -88,10 +88,19 @@ def transform_trips(trips_df: pd.DataFrame, lookups: dict) -> pd.DataFrame:
     df = trips_df.copy()
 
     df["date_key"] = df["requested_at"].dt.strftime("%Y%m%d").astype(int)
+    before_date_filter = len(df)
     df = df[df["date_key"].isin(lookups["date"]["date_key"])]
-    if len(df) < initial_count:
-        logger.warning(f"{initial_count - len(df)} trip(s) outside of dim_date range — skipped")
+    if len(df) < before_date_filter:
+        logger.warning(f"{before_date_filter - len(df)} trip(s) outside of dim_date range — skipped")
 
+    df["time_key"] = (
+        df["requested_at"].dt.hour * 100
+        + (df["requested_at"].dt.minute // 15) * 15
+    )
+    before_time_filter = len(df)
+    df = df[df["time_key"].isin(lookups["time"]["time_key"])]
+    if len(df) < before_time_filter:
+        logger.warning(f"{before_time_filter - len(df)} trip(s) outside of dim_time range — skipped")
     df = df.merge(lookups["driver"], on="driver_id", how="left")
     df = _drop_unmatched(df, "driver_key", "driver_key (dim_driver)")
 
@@ -113,6 +122,10 @@ def transform_trips(trips_df: pd.DataFrame, lookups: dict) -> pd.DataFrame:
     # payment_method_id / promo_code_id are nullable in trips (e.g. no_show trips
     # have no payment method) and fact_trips allows NULL for both — a row is only
     # dropped when the OLTP row *has* a value that the merge failed to resolve.
+
+    df["payment_method_id"] = pd.to_numeric(df["payment_method_id"], errors="coerce")
+    df["promo_code_id"] = pd.to_numeric(df["promo_code_id"], errors="coerce")
+    
     df = df.merge(lookups["payment_method"], on="payment_method_id", how="left")
     bad_pm = df["payment_method_id"].notna() & df["payment_method_key"].isna()
     if bad_pm.any():
@@ -125,8 +138,12 @@ def transform_trips(trips_df: pd.DataFrame, lookups: dict) -> pd.DataFrame:
         logger.warning(f"{bad_promo.sum()} trip(s) with unknown promo_code_id — skipped")
     df = df[~bad_promo]
 
+    df = df.merge(lookups["vehicle"], on="vehicle_id", how="left")
+    df = _drop_unmatched(df, "vehicle_key", "vehicle_key (dim_vehicle)")
+
     for col in ("driver_key", "passenger_key", "pickup_location_key",
-                "dropoff_location_key", "payment_method_key", "promo_code_key"):
+                "dropoff_location_key", "payment_method_key", "promo_code_key",
+                "vehicle_key"):
         df[col] = df[col].astype("Int64")
 
     df["base_fare"] = df["base_fare"].fillna(0)

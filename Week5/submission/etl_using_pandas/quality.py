@@ -41,7 +41,7 @@ def check_row_count(df: pd.DataFrame, min_rows: int = 1) -> dict:
 
 
 def check_no_negative_fares(df: pd.DataFrame) -> dict:
-    """Fail if any row has fare_amount <= 0."""
+    """Fail if any row has fare_amount < 0."""
     bad = int((df["fare_amount"] < 0).sum())
     return {
         "check": "no_negative_fares",
